@@ -1,0 +1,123 @@
+name: PR 35989 staging validation
+
+on:
+  push:
+    branches:
+      - pr-35989-fix-staging
+    paths:
+      - .github/workflows/pr-35989-staging-test.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sanitizer-regressions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: pr-35989-fix-staging
+
+      - name: Apply candidate fixes
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one match, found {count}")
+              p.write_text(text.replace(old, new, 1))
+
+          # Wallet import: the stored descriptor range has an exclusive int32_t end.
+          replace_once(
+              "src/wallet/imports.cpp",
+              "#include <wallet/scan.h>\n\nnamespace wallet {",
+              "#include <wallet/scan.h>\n\n#include <limits>\n\nnamespace wallet {",
+          )
+          replace_once(
+              "src/wallet/imports.cpp",
+              '''        } else {\n            warnings.emplace_back("Range not given, using default keypool range");\n            range_start = 0;\n            range_end = wallet.m_keypool_size;\n        }\n        next_index = request.next_index.value_or(range_start);\n''',
+              '''        } else {\n            warnings.emplace_back("Range not given, using default keypool range");\n            range_start = 0;\n            range_end = wallet.m_keypool_size;\n        }\n        // WalletDescriptor stores range_end as int32_t. Since the imported end is\n        // exclusive, an inclusive endpoint of INT32_MAX cannot be represented.\n        if (range_end > std::numeric_limits<int32_t>::max()) {\n            return ImportResult(WalletErrorCode::InvalidParameter,\n                "End of range is too high", warnings);\n        }\n        next_index = request.next_index.value_or(range_start);\n''',
+          )
+
+          # Keypool top-up: perform the addition in a type wide enough for every input.
+          replace_once(
+              "src/wallet/scriptpubkeyman.cpp",
+              "#include <optional>\n",
+              "#include <limits>\n#include <optional>\n",
+          )
+          replace_once(
+              "src/wallet/scriptpubkeyman.cpp",
+              '''    // Calculate the new range_end\n    int32_t new_range_end = std::max(m_wallet_descriptor.GetNext() + (int32_t)target_size, m_wallet_descriptor.GetEnd());\n''',
+              '''    // Calculate the new range_end. next_index can be INT32_MAX and target_size\n    // is user controlled, so compute the end in a wider type.\n    const int64_t target_end{int64_t{m_wallet_descriptor.GetNext()} + target_size};\n    int32_t new_range_end = m_wallet_descriptor.GetEnd();\n    if (target_end <= std::numeric_limits<int32_t>::max()) {\n        new_range_end = std::max(static_cast<int32_t>(target_end), new_range_end);\n    }\n''',
+          )
+
+          # Shared descriptor-range validation: reject reversed ranges before arithmetic.
+          replace_once(
+              "src/script/descriptor.cpp",
+              '''    if ((high >> 31) != 0) {\n        return util::Unexpected<std::string>("End of range is too high");\n    }\n    if (high >= low + 1000000) {\n        return util::Unexpected<std::string>("Range is too large");\n    }\n    if (low > high) {\n        return util::Unexpected<std::string>("Range specified as [begin,end] must not have begin after end");\n    }\n''',
+              '''    if (low > high) {\n        return util::Unexpected<std::string>("Range specified as [begin,end] must not have begin after end");\n    }\n    if ((high >> 31) != 0) {\n        return util::Unexpected<std::string>("End of range is too high");\n    }\n    if (high - low >= 1000000) {\n        return util::Unexpected<std::string>("Range is too large");\n    }\n''',
+          )
+
+          # Unit regression for the INT64_MAX reversed-range overflow.
+          replace_once(
+              "src/wallet/test/wallet_tests.cpp",
+              '''    const std::array invalid_ranges{\n        std::pair{std::pair<int64_t, int64_t>{2, 1}, "Range specified as [begin,end] must not have begin after end"},\n''',
+              '''    const std::array invalid_ranges{\n        std::pair{std::pair<int64_t, int64_t>{std::numeric_limits<int64_t>::max(), 0}, "Range specified as [begin,end] must not have begin after end"},\n        std::pair{std::pair<int64_t, int64_t>{2, 1}, "Range specified as [begin,end] must not have begin after end"},\n''',
+          )
+
+          # Functional import regressions from the original PR, rebased onto the new import interface.
+          replace_once(
+              "test/functional/wallet_importdescriptors.py",
+              '''    def test_rescan_fails_import(self):\n''',
+              '''    def test_keypool_range_bound(self):\n        self.log.info("Test that a -keypool larger than the descriptor range is rejected on import")\n        self.restart_node(1, extra_args=self.extra_args[1] + ["-keypool=3000000000"])\n        node = self.nodes[1]\n        node.createwallet(wallet_name="keypool_bound", blank=True)\n        wrpc = node.get_wallet_rpc("keypool_bound")\n        desc = descsum_create("wpkh(tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK/0h/0h/*)")\n        self.test_importdesc({"desc": desc, "timestamp": "now"},\n                             success=False, error_code=-8, error_message="End of range is too high",\n                             warnings=["Range not given, using default keypool range"], wallet=wrpc)\n        assert_equal(wrpc.listdescriptors()["descriptors"], [])\n        wrpc.unloadwallet()\n        self.restart_node(1, extra_args=self.extra_args[1])\n        self.connect_nodes(0, 1)\n\n    def test_rescan_fails_import(self):\n''',
+          )
+          replace_once(
+              "test/functional/wallet_importdescriptors.py",
+              '''        self.test_importdesc({"desc": descsum_create(desc), "timestamp": "now", "range": [0, 1000001]},\n                              success=False, error_code=-8, error_message='Range is too large')\n\n        self.log.info("Verify we can only extend descriptor's range")\n''',
+              '''        self.test_importdesc({"desc": descsum_create(desc), "timestamp": "now", "range": [0, 1000001]},\n                              success=False, error_code=-8, error_message='Range is too large')\n\n        # WalletDescriptor stores an exclusive int32_t end. An inclusive endpoint\n        # of INT32_MAX therefore needs an unrepresentable exclusive end of 2^31.\n        self.test_importdesc({"desc": descsum_create("wpkh(" + xpub + "/0/*)"), "timestamp": "now",\n                              "range": [2**31 - 1, 2**31 - 1]},\n                              success=False, error_code=-8, error_message='End of range is too high')\n\n        self.log.info("Verify we can only extend descriptor's range")\n''',
+          )
+          replace_once(
+              "test/functional/wallet_importdescriptors.py",
+              '''        self.test_per_item_errors_are_reported_in_order()\n        self.test_rescan_fails_import()\n''',
+              '''        self.test_per_item_errors_are_reported_in_order()\n        self.test_keypool_range_bound()\n        self.test_rescan_fails_import()\n''',
+          )
+
+          # Functional regression for keypoolrefill reaching next_index + INT32_MAX.
+          replace_once(
+              "test/functional/wallet_keypool.py",
+              '''    def run_test(self):\n        nodes = self.nodes\n        addr_before_encrypting = nodes[0].getnewaddress()\n''',
+              '''    def run_test(self):\n        nodes = self.nodes\n\n        nodes[0].createwallet(wallet_name="keypool_overflow")\n        overflow_wallet = nodes[0].get_wallet_rpc("keypool_overflow")\n        for address_type in ["legacy", "p2sh-segwit", "bech32", "bech32m"]:\n            overflow_wallet.getnewaddress(address_type=address_type)\n            overflow_wallet.getrawchangeaddress(address_type=address_type)\n        descriptors_before = overflow_wallet.listdescriptors()["descriptors"]\n        assert_equal(sorted({desc["next_index"] for desc in descriptors_before}), [1])\n\n        info_before = overflow_wallet.getwalletinfo()\n        assert_raises_rpc_error(-4, "Error refreshing keypool.", overflow_wallet.keypoolrefill, 2**31 - 1)\n        info_after = overflow_wallet.getwalletinfo()\n        assert_equal(info_after["keypoolsize"], info_before["keypoolsize"])\n        assert_equal(info_after["keypoolsize_hd_internal"], info_before["keypoolsize_hd_internal"])\n        assert_equal(overflow_wallet.listdescriptors()["descriptors"], descriptors_before)\n        overflow_wallet.unloadwallet()\n\n        addr_before_encrypting = nodes[0].getnewaddress()\n''',
+          )
+          PY
+
+          git diff --check
+          python3 -m py_compile test/functional/wallet_importdescriptors.py test/functional/wallet_keypool.py
+          git diff -- src/wallet/imports.cpp src/wallet/scriptpubkeyman.cpp src/script/descriptor.cpp src/wallet/test/wallet_tests.cpp test/functional/wallet_importdescriptors.py test/functional/wallet_keypool.py
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libevent-dev libboost-dev libsqlite3-dev libzmq3-dev libcapnp-dev capnproto python3-zmq
+
+      - name: Configure with UBSan and integer sanitizer
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          cmake -B build -GNinja -DBUILD_GUI=OFF -DBUILD_BENCH=OFF -DBUILD_FUZZ_BINARY=OFF -DSANITIZERS=integer,undefined
+
+      - name: Build targeted binaries
+        run: cmake --build build --target bitcoind bitcoin-cli test_bitcoin -j2
+
+      - name: Run unit regression
+        run: build/bin/test_bitcoin --run_test=wallet_tests/reject_invalid_descriptor_ranges --log_level=test_suite
+
+      - name: Run functional regressions
+        run: python3 test/functional/test_runner.py --configfile=build/test/config.ini wallet_importdescriptors.py wallet_keypool.py --jobs=1
